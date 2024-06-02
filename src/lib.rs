@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_variables)]
 
 pub mod kaart {
     use core::cmp::Ordering::{self, Equal, Greater, Less};
@@ -62,8 +62,36 @@ pub mod kaart {
     }
 
     impl Kaart {
-        fn new(kleur: Kleur, waarde: Waarde) -> Self {
+        pub fn new(kleur: Kleur, waarde: Waarde) -> Self {
             Self { kleur, waarde }
+        }
+
+        pub fn maak_deck() -> [Kaart; 52] {
+            let mut deck = [Kaart::new(Harten, Aas); 52];
+
+            for i in 0..52u8 {
+                deck[i as usize] = Kaart::new(
+                    if i % 4 == 0 {
+                        Harten
+                    } else if i % 4 == 1 {
+                        Klaveren
+                    } else if i % 4 == 2 {
+                        Schoppen
+                    } else {
+                        Ruiten
+                    },
+                    match i % 13 {
+                        0 => Aas,
+                        1..=9 => Tal(i + 1),
+                        10 => Boer,
+                        11 => Koningin,
+                        12 => Koning,
+                        _ => unreachable!(),
+                    },
+                )
+            }
+
+            deck
         }
     }
 
@@ -365,32 +393,163 @@ pub mod kaart {
     }
 }
 
-pub mod spel {
-    use crate::kaart::*;
+use std::{cell::OnceCell, sync::atomic::{AtomicU64, Ordering}};
 
-    enum Positie {
-        Dealer,
-        SmallBlind,
-        BigBlind,
-        Overige
+use crate::kaart::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SpelStatus {
+    Wachtend,
+    Lopend,
+    Gestopt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Positie {
+    Dealer,
+    SmallBlind,
+    BigBlind,
+    Overige,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SpelerId(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SpelId(u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Speler {
+    id: OnceCell<SpelerId>,
+    naam: String,
+    chips: u64,
+    hand: Option<[Kaart; 2]>,
+}
+
+const CHIPS_PER_SPELER: u64 = 1000;
+
+impl Speler {
+    pub fn new_zonder_id(naam: String) -> Self {
+        Speler {
+            id: OnceCell::new(),
+            naam,
+            chips: CHIPS_PER_SPELER,
+            hand: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Spel {
+    id: OnceCell<SpelId>,
+    spelers: Vec<SpelerId>,
+    pot: u64,
+    tafel: (Option<[Kaart; 3]>, Option<Kaart>, Option<Kaart>),
+    huidige_dealer: usize, // index in vector van spelers
+    aan_de_beurt: usize,   // index in vector van spelers
+    deck: Vec<Kaart>,
+    status: SpelStatus,
+}
+
+impl Spel {
+    pub fn new(toegekende_id: SpelId) -> Self {
+        Spel {
+            id: OnceCell::from(toegekende_id),
+            spelers: Vec::new(),
+            pot: 0,
+            tafel: (None, None, None),
+            huidige_dealer: 0,
+            aan_de_beurt: 1,
+            deck: Kaart::maak_deck().to_vec(),
+            status: SpelStatus::Wachtend,
+        }
+    }
+}
+
+enum Actie {
+    Fold,
+    Call,
+    Bet(u64),
+    Raise(u64),
+}
+
+#[derive(Debug)]
+struct Centrale {
+    spelers: Vec<Speler>,
+    spellen: Vec<Spel>,
+
+    volgende_geldige_speler_id: AtomicU64,
+    volgende_geldige_spel_id: AtomicU64,
+}
+
+impl Centrale {
+    fn new() -> Self {
+        Centrale {
+            spelers: Vec::new(),
+            spellen: Vec::new(),
+            volgende_geldige_spel_id: 0.into(),
+            volgende_geldige_speler_id: 0.into(),
+        }
     }
 
-    pub struct Speler {
-        naam: String,
-        chips: u64,
-        hand: Option<[Kaart; 2]>,
-        positie: Positie
+    fn laad_uit_db() -> Self {
+        unimplemented!()
     }
 
-    pub struct Spel {
-        spelers: Vec<Speler>,
-        pot: u64,
-        tafel: (
-            Option<[Kaart; 3]>,
-            Option<Kaart>,
-            Option<Kaart>
-        ),
-        huidige_dealer: usize, // index in vector van spelers
-        aan_de_beurt: usize, // index in vector van spelers
+    fn registreer_speler(&mut self, speler: Speler) -> SpelerId {
+        let geregistreerde_id = SpelerId(self.volgende_geldige_speler_id.fetch_add(1, Ordering::Relaxed));
+        speler
+            .id
+            .set(geregistreerde_id)
+            .expect("Speler had al een ID.");
+        self.spelers.push(speler);
+        geregistreerde_id
+    }
+
+    fn verwijder_speler(&mut self, speler_id: SpelerId) {
+        self.spelers.swap_remove(
+            self.spelers
+                .iter()
+                .position(|s| s.id.get().unwrap() == &speler_id)
+                .unwrap(),
+        );
+    }
+
+    fn maak_spel(&mut self, spelers: Vec<SpelerId>) -> SpelId {
+        let geregistreerde_id = SpelId(self.volgende_geldige_spel_id.fetch_add(1, Ordering::Relaxed));
+        let mut leeg_spel = Spel::new(geregistreerde_id);
+        leeg_spel.spelers = spelers;
+        self.spellen.push(leeg_spel);
+        geregistreerde_id
+    }
+
+    fn stuur_actie(&mut self, speler_id: SpelerId, spel_id: SpelId, actie: Actie) {
+        unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn basic_spel() {
+        let speler_a = Speler::new_zonder_id(String::from("Jakobus"));
+        let speler_b = Speler::new_zonder_id(String::from("Annemarieke"));
+        let speler_c = Speler::new_zonder_id(String::from("Maruschka"));
+
+        let mut centrale = Centrale::new();
+
+        let id_a = centrale.registreer_speler(speler_a);
+        let id_b = centrale.registreer_speler(speler_b);
+        let id_c = centrale.registreer_speler(speler_c);
+
+        dbg!(id_b);
+
+        let spel_id = centrale.maak_spel(vec![id_a, id_b, id_c]);
+
+        assert!(id_a == SpelerId(0));
+        assert!(id_b == SpelerId(1));
+        assert!(id_c == SpelerId(2));
+        assert!(spel_id == SpelId(0));
     }
 }
