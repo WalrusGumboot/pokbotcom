@@ -1,5 +1,7 @@
 #![allow(dead_code, unused_variables)]
 
+use rand::prelude::*;
+
 pub mod kaart {
     use core::cmp::Ordering::{self, Equal, Greater, Less};
 
@@ -393,7 +395,11 @@ pub mod kaart {
     }
 }
 
-use std::{cell::OnceCell, sync::atomic::{AtomicU64, Ordering}};
+use std::{
+    cell::OnceCell,
+    ops::Rem,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::kaart::*;
 
@@ -402,14 +408,6 @@ enum SpelStatus {
     Wachtend,
     Lopend,
     Gestopt,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Positie {
-    Dealer,
-    SmallBlind,
-    BigBlind,
-    Overige,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -423,10 +421,13 @@ pub struct Speler {
     id: OnceCell<SpelerId>,
     naam: String,
     chips: u64,
-    hand: Option<[Kaart; 2]>,
+    hand: Option<(Kaart, Kaart)>,
+    inzet: u64,
 }
 
 const CHIPS_PER_SPELER: u64 = 1000;
+const SMALL_BLIND: u64 = 10;
+const BIG_BLIND: u64 = 20;
 
 impl Speler {
     pub fn new_zonder_id(naam: String) -> Self {
@@ -435,6 +436,31 @@ impl Speler {
             naam,
             chips: CHIPS_PER_SPELER,
             hand: None,
+            inzet: 0,
+        }
+    }
+
+    pub fn stuur_bericht(&self, bericht: impl std::fmt::Display) {
+        println!(
+            "[{}]: {bericht}",
+            self.naam
+                .chars()
+                .chain([' '].into_iter().cycle())
+                .take(4)
+                .fold(String::new(), |mut acc, c| {
+                    acc.push(c);
+                    acc
+                })
+        )
+    }
+
+    pub fn zet_chips_in(&mut self, te_vorderen: u64) -> Result<(), ()> {
+        if self.chips >= te_vorderen {
+            self.chips -= te_vorderen;
+            self.inzet += te_vorderen;
+            Ok(())
+        } else {
+            Err(())
         }
     }
 }
@@ -448,6 +474,8 @@ pub struct Spel {
     huidige_dealer: usize, // index in vector van spelers
     aan_de_beurt: usize,   // index in vector van spelers
     deck: Vec<Kaart>,
+    huidige_inzet: u64,
+    laatste_actionabele_speler: Option<SpelerId>,
     status: SpelStatus,
 }
 
@@ -461,20 +489,22 @@ impl Spel {
             huidige_dealer: 0,
             aan_de_beurt: 1,
             deck: Kaart::maak_deck().to_vec(),
+            huidige_inzet: BIG_BLIND,
+            laatste_actionabele_speler: None,
             status: SpelStatus::Wachtend,
         }
     }
 }
 
-enum Actie {
+pub enum Actie {
     Fold,
+    Check,
     Call,
     Bet(u64),
-    Raise(u64),
 }
 
 #[derive(Debug)]
-struct Centrale {
+pub struct Centrale {
     spelers: Vec<Speler>,
     spellen: Vec<Spel>,
 
@@ -497,7 +527,10 @@ impl Centrale {
     }
 
     fn registreer_speler(&mut self, speler: Speler) -> SpelerId {
-        let geregistreerde_id = SpelerId(self.volgende_geldige_speler_id.fetch_add(1, Ordering::Relaxed));
+        let geregistreerde_id = SpelerId(
+            self.volgende_geldige_speler_id
+                .fetch_add(1, Ordering::Relaxed),
+        );
         speler
             .id
             .set(geregistreerde_id)
@@ -516,15 +549,115 @@ impl Centrale {
     }
 
     fn maak_spel(&mut self, spelers: Vec<SpelerId>) -> SpelId {
-        let geregistreerde_id = SpelId(self.volgende_geldige_spel_id.fetch_add(1, Ordering::Relaxed));
+        let geregistreerde_id = SpelId(
+            self.volgende_geldige_spel_id
+                .fetch_add(1, Ordering::Relaxed),
+        );
         let mut leeg_spel = Spel::new(geregistreerde_id);
         leeg_spel.spelers = spelers;
         self.spellen.push(leeg_spel);
         geregistreerde_id
     }
 
-    fn stuur_actie(&mut self, speler_id: SpelerId, spel_id: SpelId, actie: Actie) {
-        unimplemented!()
+    fn start_spel(&mut self, spel_id: SpelId) {
+        let spel = self
+            .spellen
+            .iter_mut()
+            .find(|s| s.id.get().unwrap() == &spel_id)
+            .unwrap();
+        assert!(spel.spelers.len() >= 2);
+
+        spel.deck = Kaart::maak_deck().to_vec();
+        let mut rng = thread_rng();
+        spel.deck.shuffle(&mut rng);
+
+        spel.status = SpelStatus::Lopend;
+
+        spel.tafel = (None, None, None);
+
+        spel.huidige_inzet = BIG_BLIND;
+
+        for (lokale_id, speler_id) in spel.spelers.iter().enumerate() {
+            let speler = self.spelers.iter_mut().find(|s| s.id.get().unwrap() == speler_id).unwrap();
+            speler.hand = Some((spel.deck.pop().unwrap(), spel.deck.pop().unwrap()));
+            speler.stuur_bericht("hand leeggemaakt");
+
+            if lokale_id == (spel.huidige_dealer + 1).rem(spel.spelers.len()) {
+                speler
+                    .zet_chips_in(SMALL_BLIND)
+                    .expect("Geen chips meer over.");
+            } else if lokale_id == (spel.huidige_dealer + 2).rem(spel.spelers.len()) {
+                speler
+                    .zet_chips_in(BIG_BLIND)
+                    .expect("Geen chips meer over.");
+            }
+        }
+
+        spel.aan_de_beurt = (spel.huidige_dealer + 3).rem(spel.spelers.len());
+    }
+
+    pub fn ontvang_actie(
+        &mut self,
+        spel_id: SpelId,
+        speler_id: SpelerId,
+        actie: Actie,
+    ) -> Result<(), String> {
+        let spel = self.spellen.iter_mut().find(|s| s.id.get().unwrap() == &spel_id).unwrap();
+        let speler = self.spelers.iter_mut().find(|s| s.id.get().unwrap() == &speler_id).unwrap();
+
+        if speler_id != spel.spelers[spel.aan_de_beurt] {
+            return Err("Niet jouw beurt".to_string());
+        }
+
+        let res = match actie {
+            Actie::Fold => {
+                speler.hand = None;
+                Ok(())
+            }
+            Actie::Check => {
+                match spel.laatste_actionabele_speler {
+                    None => {
+                        spel.laatste_actionabele_speler = Some(speler_id);
+                    }
+                    Some(laatste_speler) if laatste_speler == speler_id => {
+                        // ronde klaar
+                    }
+                    _ => {}
+                }
+
+                if speler.inzet < spel.huidige_inzet {
+                    Err("Je kunt niet checken, je zit onder de huidige inzet".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Actie::Call => {
+                spel.laatste_actionabele_speler = Some(speler_id);
+
+                speler
+                    .zet_chips_in(spel.huidige_inzet - speler.inzet)
+                    .map_err(|_| "Niet genoeg chips".to_string())
+            }
+            Actie::Bet(extra_chips) => {
+                spel.laatste_actionabele_speler = Some(speler_id);
+
+                let res = speler
+                    .zet_chips_in(spel.huidige_inzet - speler.inzet + extra_chips)
+                    .map_err(|_| "Niet genoeg chips".to_string());
+                if res.is_ok() {
+                    spel.huidige_inzet += extra_chips;
+                }
+
+                res
+            }
+        };
+
+        if res.is_ok() {
+            // TODO: check gefolde spelers
+            spel.aan_de_beurt = (spel.aan_de_beurt + 1).rem(spel.spelers.len());
+        }
+
+        res
     }
 }
 
@@ -532,24 +665,43 @@ impl Centrale {
 mod tests {
     use super::*;
     #[test]
-    fn basic_spel() {
+    fn basic_spel_happy_flow() {
         let speler_a = Speler::new_zonder_id(String::from("Jakobus"));
         let speler_b = Speler::new_zonder_id(String::from("Annemarieke"));
         let speler_c = Speler::new_zonder_id(String::from("Maruschka"));
+        let speler_d = Speler::new_zonder_id(String::from("Kwezelken"));
 
         let mut centrale = Centrale::new();
 
         let id_a = centrale.registreer_speler(speler_a);
         let id_b = centrale.registreer_speler(speler_b);
         let id_c = centrale.registreer_speler(speler_c);
+        let id_d = centrale.registreer_speler(speler_d);
 
-        dbg!(id_b);
-
-        let spel_id = centrale.maak_spel(vec![id_a, id_b, id_c]);
+        let spel_id = centrale.maak_spel(vec![id_a, id_b, id_c, id_d]);
 
         assert!(id_a == SpelerId(0));
         assert!(id_b == SpelerId(1));
         assert!(id_c == SpelerId(2));
+        assert!(id_d == SpelerId(3));
         assert!(spel_id == SpelId(0));
+
+        centrale.start_spel(spel_id);
+
+        assert_eq!(centrale.spellen[0].aan_de_beurt, 3);
+
+        assert!(centrale.ontvang_actie(spel_id, id_a, Actie::Fold).is_err());
+        assert!(centrale.ontvang_actie(spel_id, id_d, Actie::Fold).is_ok());
+
+        assert_eq!(centrale.spellen[0].aan_de_beurt, 0);
+
+        assert!(centrale.ontvang_actie(spel_id, id_a, Actie::Check).is_err());
+        assert_eq!(centrale.spellen[0].aan_de_beurt, 0);
+        assert!(centrale.ontvang_actie(spel_id, id_a, Actie::Call).is_ok());
+
+        assert_eq!(centrale.spelers[0].chips, CHIPS_PER_SPELER - BIG_BLIND);
+        assert_eq!(centrale.spelers[0].inzet, BIG_BLIND);
+
+        assert!(centrale.ontvang_actie(spel_id, id_b, Actie::Bet(50)).is_ok());
     }
 }
