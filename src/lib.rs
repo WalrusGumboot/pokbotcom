@@ -139,7 +139,7 @@ pub mod kaart {
                 slice[4].waarde,
             );
 
-            let allen_dezelfde_kleur = slice.iter().all_equal();
+            let allen_dezelfde_kleur = slice.iter().map(|s| s.kleur).all_equal();
             let combinatie = match waarden {
                 (Aas, Koning, Koningin, Boer, Tal(10)) => {
                     if allen_dezelfde_kleur {
@@ -486,10 +486,11 @@ pub struct Spel {
     pub huidige_inzet: u64,
     pub laatste_actionabele_speler: Option<SpelerId>,
     pub status: SpelStatus,
+    rng: StdRng,
 }
 
 impl Spel {
-    pub fn new(toegekende_id: SpelId) -> Self {
+    pub fn new(toegekende_id: SpelId, rng_seed: Option<u64>) -> Self {
         Spel {
             id: OnceCell::from(toegekende_id),
             spelers: Vec::new(),
@@ -501,6 +502,10 @@ impl Spel {
             huidige_inzet: BIG_BLIND,
             laatste_actionabele_speler: None,
             status: SpelStatus::Wachtend,
+            rng: match rng_seed {
+                Some(seed) => StdRng::seed_from_u64(seed),
+                None => StdRng::from_entropy(),
+            },
         }
     }
 }
@@ -535,6 +540,7 @@ pub enum PokbotcomMelding {
     SpelerActie(SpelerId, Actie),
     AanDeBeurt,
     RondeOver,
+    Gewonnen(Hand, SpelerId),
 }
 
 #[derive(Debug)]
@@ -611,12 +617,12 @@ impl Centrale {
             .unwrap()
     }
 
-    pub fn maak_spel(&mut self, spelers: Vec<SpelerId>) -> SpelId {
+    pub fn maak_spel(&mut self, spelers: Vec<SpelerId>, rng_seed: Option<u64>) -> SpelId {
         let geregistreerde_id = SpelId(
             self.volgende_geldige_spel_id
                 .fetch_add(1, Ordering::Relaxed),
         );
-        let mut leeg_spel = Spel::new(geregistreerde_id);
+        let mut leeg_spel = Spel::new(geregistreerde_id, rng_seed);
         leeg_spel.spelers = spelers;
         self.spellen.push(leeg_spel);
         geregistreerde_id
@@ -631,8 +637,7 @@ impl Centrale {
         assert!(spel.spelers.len() >= 2);
 
         spel.deck = Kaart::maak_deck().to_vec();
-        let mut rng = thread_rng();
-        spel.deck.shuffle(&mut rng);
+        spel.deck.shuffle(&mut spel.rng);
 
         spel.status = SpelStatus::Lopend;
 
@@ -700,102 +705,83 @@ impl Centrale {
         }
     }
 
-    fn sorteer_handen(&self, spel_id: SpelId) -> SpelerId {
-        let spel = self
-            .spellen
-            .iter()
-            .find(|s| s.id.get().unwrap() == &spel_id)
-            .unwrap();
-        let tafel = vec![
-            spel.tafel.0.unwrap().0,
-            spel.tafel.0.unwrap().1,
-            spel.tafel.0.unwrap().2,
-            spel.tafel.1.unwrap(),
-            spel.tafel.2.unwrap(),
-        ];
-        let deelnemende_handen = self
-            .spelers
-            .iter()
-            .filter(|s| spel.spelers.contains(s.id.get().unwrap()))
-            .filter(|s| s.hand.is_some())
-            .map(|s| (s.hand.unwrap(), *s.id.get().unwrap()));
-
-        let mut beste_handen = Vec::new();
-
-        for hand_en_speler in deelnemende_handen {
-            let hand_iter = [hand_en_speler.0 .0, hand_en_speler.0 .1].into_iter();
-            for combinatie in tafel
-                .clone()
-                .into_iter()
-                .chain(hand_iter)
-                .tuple_combinations::<(_, _, _, _, _)>()
-            {
-                let array: [Kaart; 5] = [
-                    combinatie.0,
-                    combinatie.1,
-                    combinatie.2,
-                    combinatie.3,
-                    combinatie.4,
-                ];
-                let berekende_hand = Hand::new(array);
-                beste_handen.push((berekende_hand, hand_en_speler.1));
-            }
-        }
-
-        beste_handen.sort_by(|(h1, _), (h2, _)| h1.cmp(h2).reverse());
-
-        beste_handen[0].1
-    }
-
-    pub fn ronde_klaar(&mut self, spel_id: SpelId) {
-        self.stuur_naar_alle_spelers(spel_id, PokbotcomMelding::RondeOver);
+    fn naar_volgende_gesamtronde(&mut self, spel_id: SpelId) -> Result<()> {
         let spel = self
             .spellen
             .iter_mut()
             .find(|s| s.id.get().unwrap() == &spel_id)
             .unwrap();
 
-        match spel.tafel {
+        spel.huidige_dealer = (spel.huidige_dealer + 1) % spel.spelers.len();
+
+        spel.tafel = (None, None, None);
+
+        spel.huidige_inzet = BIG_BLIND;
+
+        for (lokale_id, speler_id) in spel.spelers.iter().enumerate() {
+            let speler = self
+                .spelers
+                .iter_mut()
+                .find(|s| s.id.get().unwrap() == speler_id)
+                .unwrap();
+            speler.hand = Some((spel.deck.pop().unwrap(), spel.deck.pop().unwrap()));
+            speler.stuur_bericht(
+                PokbotcomMelding::Hand(speler.hand.unwrap().0, speler.hand.unwrap().1),
+                false,
+            );
+
+            if lokale_id == (spel.huidige_dealer + 1).rem(spel.spelers.len()) {
+                speler.zet_chips_in(SMALL_BLIND)?;
+            } else if lokale_id == (spel.huidige_dealer + 2).rem(spel.spelers.len()) {
+                speler.zet_chips_in(BIG_BLIND)?;
+            } else if lokale_id == (spel.huidige_dealer + 3).rem(spel.spelers.len()) {
+                speler.stuur_bericht(PokbotcomMelding::AanDeBeurt, false);
+            }
+        }
+
+        spel.aan_de_beurt = (spel.huidige_dealer + 3).rem(spel.spelers.len());
+
+        Ok(())
+    }
+
+    pub fn ronde_klaar(&mut self, spel_id: SpelId) -> Result<()> {
+        self.stuur_naar_alle_spelers(spel_id, PokbotcomMelding::RondeOver);
+        self.verzamel_pot(spel_id);
+        let spel = self
+            .spellen
+            .iter_mut()
+            .by_ref()
+            .find(|s| s.id.get().unwrap() == &spel_id)
+            .unwrap();
+
+        spel.laatste_actionabele_speler = None;
+        spel.huidige_inzet = 0;
+
+        let melding = match spel.tafel {
             (None, None, None) => {
                 let flop = (
                     spel.deck.pop().unwrap(),
                     spel.deck.pop().unwrap(),
                     spel.deck.pop().unwrap(),
                 );
+
                 spel.tafel.0 = Some(flop);
-                self.stuur_naar_alle_spelers(
-                    spel_id,
-                    PokbotcomMelding::Flop(flop.0, flop.1, flop.2),
-                );
-                self.verzamel_pot(spel_id);
+                PokbotcomMelding::Flop(flop.0, flop.1, flop.2)
             }
             (Some(_), None, None) => {
                 let turn = spel.deck.pop().unwrap();
+
                 spel.tafel.1 = Some(turn);
-                self.stuur_naar_alle_spelers(spel_id, PokbotcomMelding::Turn(turn));
-                self.verzamel_pot(spel_id);
+                PokbotcomMelding::Turn(turn)
             }
             (Some(_), Some(_), None) => {
                 let river = spel.deck.pop().unwrap();
+
                 spel.tafel.2 = Some(river);
-                self.stuur_naar_alle_spelers(spel_id, PokbotcomMelding::River(river));
-                self.verzamel_pot(spel_id);
+                PokbotcomMelding::River(river)
             }
             (Some(_), Some(_), Some(_)) => {
-                // spelletje over he
-                self.stuur_naar_alle_spelers(spel_id, PokbotcomMelding::RondeOver);
-                // self.verzamel_pot(spel_id);
-                for speler_id in spel.spelers.iter_mut() {
-                    let speler = self
-                        .spelers
-                        .iter_mut()
-                        .find(|s| s.id.get().unwrap() == speler_id)
-                        .unwrap();
-                    spel.pot += speler.inzet;
-                    speler.inzet = 0;
-                }
-
-                // TODO: HERWERK DIT
+                // spelletje klaar
 
                 let tafel = vec![
                     spel.tafel.0.unwrap().0,
@@ -828,6 +814,7 @@ impl Centrale {
                             combinatie.3,
                             combinatie.4,
                         ];
+                        // TODO: check of de tafel de winnende hand beet heeft
                         let berekende_hand = Hand::new(array);
                         beste_handen.push((berekende_hand, hand_en_speler.1));
                     }
@@ -835,12 +822,40 @@ impl Centrale {
 
                 beste_handen.sort_by(|(h1, _), (h2, _)| h1.cmp(h2).reverse());
 
-                let winnaar_id = beste_handen[0].1;
-                let winnaar = self.get_mut_speler(winnaar_id);
+                let winnaar = self
+                    .spelers
+                    .iter_mut()
+                    .find(|s| s.id.get().unwrap() == &beste_handen[0].1)
+                    .unwrap();
                 winnaar.chips += spel.pot;
+                spel.pot = 0;
+
+                PokbotcomMelding::Gewonnen(beste_handen[0].0, beste_handen[0].1)
             }
             _ => unreachable!(),
+        };
+
+        spel.aan_de_beurt = spel.huidige_dealer;
+        loop {
+            spel.aan_de_beurt = (spel.aan_de_beurt + 1) % spel.spelers.len();
+            if self
+                .spelers
+                .iter()
+                .find(|s| s.id.get().unwrap() == &spel.spelers[spel.aan_de_beurt])
+                .unwrap()
+                .hand
+                .is_some()
+            {
+                break;
+            }
         }
+
+        self.stuur_naar_alle_spelers(spel_id, melding);
+        if matches!(melding, PokbotcomMelding::Gewonnen(..)) {
+            self.naar_volgende_gesamtronde(spel_id)?;
+        }
+
+        Ok(())
     }
 
     pub fn ontvang_actie(
@@ -897,7 +912,7 @@ impl Centrale {
                             spel.laatste_actionabele_speler = Some(speler_id);
                         }
                         Some(laatste_speler) if laatste_speler == speler_id => {
-                            return Ok(self.ronde_klaar(spel_id));
+                            return self.ronde_klaar(spel_id);
                         }
                         _ => {}
                     }
@@ -941,7 +956,7 @@ impl Centrale {
                         .laatste_actionabele_speler
                         .is_some_and(|id| &id == nu_actieve_speler.id.get().unwrap())
                     {
-                        return Ok(self.ronde_klaar(spel_id));
+                        return self.ronde_klaar(spel_id);
                     }
                     break;
                 } else {
@@ -961,10 +976,10 @@ mod tests {
     use super::*;
     #[test]
     fn basic_spel_happy_flow() {
-        let speler_a = Speler::new_zonder_id(String::from("A"));
-        let speler_b = Speler::new_zonder_id(String::from("B"));
-        let speler_c = Speler::new_zonder_id(String::from("C"));
-        let speler_d = Speler::new_zonder_id(String::from("D"));
+        let speler_a = Speler::new_zonder_id(String::from("Aart"));
+        let speler_b = Speler::new_zonder_id(String::from("Bart"));
+        let speler_c = Speler::new_zonder_id(String::from("Cart"));
+        let speler_d = Speler::new_zonder_id(String::from("Dart"));
 
         let mut centrale = Centrale::new();
 
@@ -973,7 +988,7 @@ mod tests {
         let id_c = centrale.registreer_speler(speler_c).unwrap();
         let id_d = centrale.registreer_speler(speler_d).unwrap();
 
-        let spel_id = centrale.maak_spel(vec![id_a, id_b, id_c, id_d]);
+        let spel_id = centrale.maak_spel(vec![id_a, id_b, id_c, id_d], Some(0));
 
         assert!(id_a == SpelerId(0));
         assert!(id_b == SpelerId(1));
@@ -1008,9 +1023,28 @@ mod tests {
         assert_eq!(centrale.spelers[2].chips, CHIPS_PER_SPELER - BIG_BLIND - 50);
 
         assert_eq!(centrale.spellen[0].aan_de_beurt, 0);
-
+        
+        // Door te folden, kunnen we de turn te zien krijgen.
         assert!(centrale.ontvang_actie(spel_id, id_a, Actie::Fold).is_ok());
+        
+        assert!(centrale.ontvang_actie(spel_id, id_b, Actie::Check).is_ok());
+        assert!(centrale.ontvang_actie(spel_id, id_c, Actie::Check).is_ok());
+        // De flop
+        assert!(centrale.ontvang_actie(spel_id, id_b, Actie::Check).is_ok());
+        assert!(centrale.ontvang_actie(spel_id, id_c, Actie::Check).is_ok());
 
-        panic!("{:?}", centrale.spellen[0].laatste_actionabele_speler);
+        // We checken even of de pot wel degelijk 50 + 50 + drie BIG_BLINDS bevat
+        assert_eq!(centrale.spellen[0].pot, 50 + 50 + BIG_BLIND + BIG_BLIND + BIG_BLIND);
+
+        // De river
+        assert!(centrale.ontvang_actie(spel_id, id_b, Actie::Check).is_ok());
+        assert!(centrale.ontvang_actie(spel_id, id_c, Actie::Check).is_ok());
+        
+        // Cart heeft een straight, wat de beste hand is. Dus Cart wint de pot.
+        // Hij is Big blind en heeft 50 gebet, dus zou op CHIPS_PER_SPELER - 50 - BIG BLIND + (POT) moeten zitten
+        assert_eq!(centrale.spelers[2].chips, CHIPS_PER_SPELER - 50 - BIG_BLIND + (50 + 50 + BIG_BLIND + BIG_BLIND + BIG_BLIND));
+
+        // Gesamtronde voorbij, Aart is terug aan de beurt.
+        assert_eq!(centrale.spellen[0].aan_de_beurt, 0);
     }
 }
