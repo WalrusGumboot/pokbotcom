@@ -827,7 +827,10 @@ impl Centrale {
                     .iter_mut()
                     .find(|s| s.id.get().unwrap() == &beste_handen[0].1)
                     .unwrap();
+                dbg!(winnaar.chips);
+                dbg!(spel.pot);
                 winnaar.chips += spel.pot;
+                dbg!(winnaar.chips);
                 spel.pot = 0;
 
                 PokbotcomMelding::Gewonnen(beste_handen[0].0, beste_handen[0].1)
@@ -1042,9 +1045,10 @@ mod tests {
         
         // Cart heeft een straight, wat de beste hand is. Dus Cart wint de pot.
         // Hij is Big blind en heeft 50 gebet, dus zou op CHIPS_PER_SPELER - 50 - BIG BLIND + (POT) moeten zitten
-        assert_eq!(centrale.spelers[2].chips, CHIPS_PER_SPELER - 50 - BIG_BLIND + (50 + 50 + BIG_BLIND + BIG_BLIND + BIG_BLIND));
+        // MAAR aangezien de volgende ronde onmiddellijk al begonnen is, en Cart daarin Small Blind is, gaat er nog SMALL_BLIND vanaf gegaan zijn
+        assert_eq!(centrale.spelers[2].chips, CHIPS_PER_SPELER - 50 - BIG_BLIND + (50 + 50 + BIG_BLIND + BIG_BLIND + BIG_BLIND) - SMALL_BLIND);
 
-        // Gesamtronde voorbij, Aart is terug aan de beurt.
+        // Gesamtronde voorbij, Aart is aan de beurt aangezien Bart dealt, Cart SB en Dart BB is.
         assert_eq!(centrale.spellen[0].aan_de_beurt, 0);
     }
 }
